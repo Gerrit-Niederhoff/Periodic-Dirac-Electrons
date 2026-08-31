@@ -1,0 +1,10 @@
+cache/
+saved/
+latex/
+old_code/
+plots/
+mathematica/
+.DS_store
+__pycache__
+.ipynb_checkpoints/
+.python-version
