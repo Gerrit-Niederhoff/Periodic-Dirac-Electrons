@@ -8,3 +8,4 @@ mathematica/
 __pycache__
 .ipynb_checkpoints/
 .python-version
+wannier90/

@@ -4,6 +4,7 @@ import myBM as bm
 import json
 import hashlib
 from pathlib import Path
+import wan90
 
 
 def make_data_key(params):
@@ -16,7 +17,8 @@ def disk_cached(cache_dir="cache"):
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     def decorator(func):
-        def wrapper(**params):
+        # arrays should be numpy arrays that are input, shouldn't be cached and therefore given as POSITIONAL arguments ONLY.
+        def wrapper(*arrays, **params):
             updatebool = params.pop("give_updates", False)
             chunksize = params.pop("points_per_chunk", 2048)
             key = make_data_key(params)
@@ -31,7 +33,9 @@ def disk_cached(cache_dir="cache"):
                     return {name: data[name] for name in data.files}
 
             # Cache miss
-            result = func(**params, give_updates=updatebool, points_per_chunk=chunksize)
+            result = func(
+                *arrays, **params, give_updates=updatebool, points_per_chunk=chunksize
+            )
 
             # Save atomically-ish into its own directory
             path.mkdir(parents=True, exist_ok=True)
@@ -58,38 +62,88 @@ def blochfactors(**kwargs):
     return bm.states_on_grid(**kwargs)
 
 
-def reduce_energy_window(new_window, cache_dir="cache", **kwargs):
+def band_selection(Ψ):
     """
-    Reduce the energy_window in a previously cached dataset. Does NOT delete the old dataset, but makes a new one with the updated parameters.
+    Reorder a set of bloch states such that the (absolute) overlap between neighbouring points in the 'same' band is maximized.
     """
-    cache_dir = Path(cache_dir)
-    old_data_key = make_data_key(kwargs)
-    path = cache_dir / old_data_key
-    old_file = path / "data.npz"
-    if old_file.exists():
-        with np.load(old_file) as data:
-            states = data["blochstates"]
-            bands = data["bands"]
-            grid = data["kgrid"]
-    else:
-        raise ValueError("File with the old parameters isn't cached.")
-    flatband = kwargs["flatband_energy"]
-    newCondition = abs(bands - flatband) < new_window
-    bands = np.where(~newCondition, bands, np.nan)
-    states = np.where(~newCondition[..., None, :], states, np.nan)
-    newData = {"blochstates": states, "bands": bands, "kgrid": grid}
-    params = kwargs.copy()
-    params.update({"energy_window": new_window})
-    newKey = make_data_key(params)
-    newPath = cache_dir / newKey
-    newPath.mkdir(parents=True)
-    newFile = newPath / "data.npz"
-    newParamFile = newPath / "params.json"
-    np.savez_compressed(newFile, **newData)
+    Ψ_x_shifted = np.roll(Ψ, 1, axis=0)
+    Ψ_x_shifted[0, ...] = Ψ_x_shifted[1, ...]
+    overlap = abs(np.sum(Ψ.conj()[..., None] * Ψ_x_shifted[..., None, :], axis=-3))
+    # Build array where the last axis has 2 elements, the first being the sum of the absolute diagonal overlaps, the second being the sum of the absolute off-diagonal overlaps.
+    comp_overlap = np.sum(overlap[..., [[0, 1], [0, 1]], [[0, 1], [1, 0]]], axis=-1)
+    # Basically Sorting this should tell you how to reorder Ψ: Wherever the array is already sorted, Ψ should also not be reordered, and vice versa.
+    ind_x = np.argsort(comp_overlap, axis=-1, descending=True)
+    Ψ = np.take_along_axis(Ψ, ind_x[:, :, None], axis=-1)
+    Ψ_y_shifted = np.roll(Ψ, 1, axis=1)
+    Ψ_y_shifted[:, 0, ...] = Ψ_y_shifted[:, 1, ...]
+    overlap = abs(np.sum(Ψ.conj()[..., None] * Ψ_y_shifted[..., None, :], axis=-3))
+    # Build array where the last axis has 2 elements, the first being the sum of the absolute diagonal overlaps, the second being the sum of the absolute off-diagonal overlaps.
+    comp_overlap = np.sum(overlap[..., [[0, 1], [0, 1]], [[0, 1], [1, 0]]], axis=-1)
+    # Basically Sorting this should tell you how to reorder Ψ: Wherever the array is already sorted, Ψ should also not be reordered, and vice versa.
+    ind_y = np.argsort(comp_overlap, axis=-1, descending=True)
+    Ψ = np.take_along_axis(Ψ, ind_y[:, :, None], axis=-1)
+    ind = np.take_along_axis(ind_x, ind_y, axis=-1)
+    return ind
 
-    with open(newParamFile, "w") as f:
-        json.dump(params, f, indent=2, sort_keys=True)
-    return
+
+def gauge_smooth(Ψ):
+    """
+    Take a bloch state Ψ, shape (KX,KY,N,M) and transform it to a smooth gauge. Note that this is abelian gauge-smoothing, and won't fix
+    band selection issues, that should be done before.
+    """
+    Ψ_x_shifted = np.roll(Ψ, 1, axis=0)
+    Ψ_x_shifted[0, ...] = Ψ_x_shifted[1, ...]
+    # Phase difference from each kx value to the previous one, except at 0:
+    overlap = np.sum(Ψ.conj() * Ψ_x_shifted, axis=2)
+    φ_diff = np.angle(overlap)
+    Ψ *= np.cumprod(np.exp(1j * φ_diff), axis=0)[:, :, None]
+    Ψ_y_shifted = np.roll(Ψ, 1, axis=1)
+    Ψ_y_shifted[:, 0, ...] = Ψ_y_shifted[:, 1, ...]
+    overlap = np.sum(Ψ.conj() * Ψ_y_shifted, axis=2)
+    φ_diff = np.angle(overlap)
+    Ψ *= np.cumprod(np.exp(1j * φ_diff), axis=1)[:, :, None]
+    return Ψ
+
+
+@disk_cached("cache")
+def two_band_subspace(momentum_radius=0.35, overlap_tolerance=0.7, **kwargs):
+    """
+    First call blochstates with all the given kwargs, then reduce the data returned to the relevant two-band subspace.
+    Within the radius given by momentum_radius, discard any states with less overall overlap with the flatbands at the zone center than overlap_tolerance.
+    The discarded blochstates are each replaced by the neighbouring state with largest overlap, which will introduce some error, but amounts to neglecting the very small observed hybridization.
+    """
+    data = blochfactors(**kwargs)
+    Ψ = data["blochstates"]
+    kgrid = data["kgrid"]
+    Nx, Ny = np.shape(Ψ)[:2]
+    # Reference states for computing overlaps:
+    fb = Ψ[Nx // 2, Ny // 2, :, :2]
+    # Computing the absolute overlap of each band with these two flat-band reference states:
+    overlap = abs(
+        np.sum(fb[None, None, :, :, None].conj() * Ψ[:, :, :, None, :], axis=2)
+    )
+    # Computing the sum of the squared overlaps with each flatband, for a sort of "total flatband overlap"
+    total_overlap = np.sum(overlap**2, axis=-2)
+    # Sorting states w.r.t this total overlap, such that the most overlapping bands come first (and then retain only the first 2)
+    overlapsort = np.argsort(total_overlap, axis=-1, descending=True)
+    flatbands = np.take_along_axis(Ψ, overlapsort[:, :, None, :], axis=-1)[..., :2]
+    total_overlap = np.take_along_axis(total_overlap, overlapsort, axis=-1)[..., :2]
+    k_condition = np.linalg.norm(kgrid, axis=-1) < momentum_radius
+    condition = (k_condition[..., None]) & (total_overlap <= overlap_tolerance)
+    idx, idy, idb = np.where(condition)
+    for i in range(len(idx)):
+        x, y, b = idx[i], idy[i], idb[i]
+        arrx = [x, x, x + 1, x - 1]
+        arry = [y + 1, y - 1, y, y]
+        neighbouring_overlaps = total_overlap[
+            arrx, arry, b
+        ]  # Should be just shape (4,), overlaps with the 4 neighbours
+        best_neighbour = np.argmax(neighbouring_overlaps)
+        flatbands[x, y, :, :] = flatbands[
+            arrx[best_neighbour], arry[best_neighbour], :, :
+        ]
+
+    return {"flatbands": flatbands}
 
 
 def nearest_indices(A, B):
@@ -181,3 +235,63 @@ def λ_formfactor(k, q, cutoff=9, **kwargs):
     λ = np.sum(states_Q[..., :, None].conj() * states_k[..., None, :], axis=-3)
 
     return λ
+
+
+@disk_cached("cache/wannier/")
+def wannier_functions(
+    r_array,
+    kgrid,
+    ψw,
+    cutoff=9,
+    give_updates=False,
+    points_per_chunk=300,
+):
+    """
+    Transform bloch states into wannier states.
+    Note that r technically should be (r-R), but R is set to 0 here without loss of generality.
+    r should be in units such that the lattice vectors (of the moire potential) have length 1.
+    """
+    scale_down = (
+        (2 * np.pi) * 2 / np.sqrt(3)
+    )  # factor by which ALL momenta (given in units where the reciprocal lattice vector length is one) should be multiplied such that the positions can be in the basis where the real space lattice vectors have length one.
+
+    nbands = np.shape(ψw)[-1]
+    Nk1, Nk2 = np.shape(kgrid)[0], np.shape(kgrid)[1]
+
+    originalrshape = np.shape(r_array)[:-1]
+    flat_position = r_array.reshape(-1, 2)
+    Nr = np.shape(flat_position)[0]
+    wannierstates = np.zeros((Nr, 2, nbands), dtype=complex)
+
+    lat = np.asarray(bm.build_lattice(cutoff)) * scale_down
+
+    for start in range(0, Nr, points_per_chunk):
+        stop = min(start + points_per_chunk, Nr)
+        if give_updates:
+            print(f"Calculating points from {start} to {stop} out of {Nr}.", flush=True)
+        r = flat_position[start:stop, :]
+        Nr_chunk = stop - start
+        blochstate_of_r = np.zeros((Nk1, Nk2, Nr_chunk, 2, nbands), dtype=complex)
+        for j, gvector in enumerate(lat):
+            blochstate_of_r += (
+                ψw[:, :, None, 2 * j : 2 * (j + 1), :]
+                * np.exp(1j * np.sum(gvector[None, :] * r, axis=-1))[
+                    None, None, :, None, None
+                ]
+            )
+        localwannierstates = np.sum(
+            blochstate_of_r
+            * np.exp(
+                1j
+                * np.sum(
+                    kgrid[:, :, None, :] * scale_down * r[None, None, :, :], axis=-1
+                )
+            )[:, :, :, None, None],
+            axis=(0, 1),
+        ) / (Nk1 * Nk2)
+        wannierstates[start:stop, :, :] = localwannierstates
+
+    return {
+        "wannierstates": wannierstates.reshape((*originalrshape, 2, nbands)),
+        "rgrid": r_array,
+    }

@@ -434,7 +434,7 @@ def states_on_grid(
         data["blochstates"] being the corresponding eigenstates (ordered the same way)
         data["kgrid"] being the Kgrid on which these states were computed, in dimensionless units where the reciprocal lattice vector has length 1.
     """
-    x = 1 / 2 * np.linspace(-1, 1, N)
+    x = 1 / 2 * np.linspace(-1, 1, N, endpoint=False)
     q = get_q(θ / 180 * np.pi)
     k1 = x[:, None] * (q2[None, :])
     k2 = -q1[None, :] * x[:, None]
@@ -514,8 +514,8 @@ def zoneshift(u, g, cutoff=8):
     uNew = np.zeros_like(u)
     for i in range(N):
         if translat[i] != -1:
-            uNew[..., 2 * i : 2 * (i + 1)] = u[
-                ..., 2 * translat[i] : 2 * (translat[i] + 1)
+            uNew[..., 2 * i : 2 * (i + 1), :] = u[
+                ..., 2 * translat[i] : 2 * (translat[i] + 1), :
             ]
     return uNew
 
