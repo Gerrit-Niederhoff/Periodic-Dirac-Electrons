@@ -4,7 +4,7 @@ import myBM as bm
 import json
 import hashlib
 from pathlib import Path
-import wan90
+from IPython.display import clear_output
 
 
 def make_data_key(params):
@@ -200,6 +200,7 @@ def λ_formfactor(k, q, cutoff=9, **kwargs):
     """
     single_particle_data = blochfactors(cutoff=cutoff, **kwargs)
     print("Bloch-states are computed.")
+    print(single_particle_data.keys())
     kdata = single_particle_data["kgrid"]
     states = single_particle_data["blochstates"]
     energies = single_particle_data["bands"]
@@ -222,15 +223,13 @@ def λ_formfactor(k, q, cutoff=9, **kwargs):
     idx_Q[:, equalmomenta] = idx_k[:, equalmomenta]
     states_Q = states[idx_Q[0], idx_Q[1], ...]  # Again, the closest possible k-points.
     # Iterating over bands to shift the blochstates to the appropriate BZ:
-    for i in range(bandnumber):
-        # Computing all shifts by the same reciprocal lattice vector in bulk:
-        for gvector in unique_RL_shifts:
-            print(gvector)
-            mask = np.isclose(Q_RL, gvector[*extra, :])
-            mask = np.all(mask, axis=-1)  # Which indices require a shift by gvector
-            states_Q[mask, :, i] = bm.zoneshift(
-                states_Q[mask, :, i], gvector, cutoff=cutoff
-            )  # Shift the blochstates at all those indices
+    for gvector in unique_RL_shifts:
+        print(gvector)
+        mask = np.isclose(Q_RL, gvector[*extra, :])
+        mask = np.all(mask, axis=-1)  # Which indices require a shift by gvector
+        states_Q[mask, :, :] = bm.zoneshift(
+            states_Q[mask, :, :], gvector, cutoff=cutoff
+        )  # Shift the blochstates at all those indices
     # Compute the overlap:
     λ = np.sum(states_Q[..., :, None].conj() * states_k[..., None, :], axis=-3)
 
@@ -295,3 +294,44 @@ def wannier_functions(
         "wannierstates": wannierstates.reshape((*originalrshape, 2, nbands)),
         "rgrid": r_array,
     }
+
+
+def Λ_single_q(wannier, rgrid, q):
+    """
+    Compute the inner product <W_a|exp(iqr)|W_b> for one single value of q.
+    """
+    phase = np.exp(1j * np.dot(rgrid, q))
+    Nrx, Nry = np.shape(phase)
+    integrand = (
+        wannier.conj()[..., :, None]
+        * wannier[..., None, :]
+        * phase[..., None, None, None]
+    )
+    integrand = integrand.reshape((-1, 2, 2))
+    return np.sum(integrand, axis=0) / Nrx / Nry
+
+
+def localized_formfactor(qgrid, wannier, rgrid, name="formfactor", showprogress=True):
+    """
+    Compute the formfactor Λ on a grid of values of q.
+    """
+    cachepath = Path("cache/wannier")
+    datafile = cachepath / f"{name}.npz"
+    if datafile.exists():
+        with np.load(datafile) as data:
+            return {name: data[name] for name in data.files}
+    qshape = np.shape(qgrid)[:-1]
+    qinput = qgrid.reshape((-1, 2))
+    Nq = len(qinput)
+    Λ = np.zeros((2, 2, Nq), dtype=complex)
+    for i, q in enumerate(qinput):
+        # For use in jupyter notebooks:
+        if showprogress:
+            print(f"{i / Nq * 100:.1f} % done.")
+            clear_output(wait=True)
+        Λ[:, :, i] = Λ_single_q(wannier, rgrid, q)
+
+    Λ = Λ.reshape((2, 2, *qshape))
+    data = {"formfactor": Λ, "qgrid": qgrid}
+    np.savez_compressed(datafile, **data)
+    return data
