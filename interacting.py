@@ -6,6 +6,15 @@ import hashlib
 from pathlib import Path
 from IPython.display import clear_output
 
+COULOMB_COUPLING = 9  # eV*nM
+
+# Screening length should be between 5 and 40 nm.
+# To scale positions from units where the lattice vector is 1, multiply by
+SCALE_FACTOR = 4 * np.pi / np.sqrt(3)
+# AND DIVIDE by the potential scale kθ. For our standard value of θ=0.72, we define the overall scaling
+PHYSICAL_SCALING = SCALE_FACTOR / bm.get_q(0.72 / 180 * np.pi)
+# Note of course that when a the screening length is given in physical units, it therefore needs to by DIVIDED by that number.
+
 
 def make_data_key(params):
     params_json = json.dumps(params, sort_keys=True)
@@ -45,6 +54,46 @@ def disk_cached(cache_dir="cache"):
             with open(params_file, "w") as f:
                 json.dump(params, f, indent=2, sort_keys=True)
 
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+def cache_under_name(cache_dir="cache/wannier"):
+    """
+    Decorate a function to save it's output to a specified file and folder, as well as a description of the generated data. If those things match previously cached output, that is loaded and returned instead. Raises an error if folder and filename match existing data, but the description differs (to prevent overwriting data).
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def decorator(func):
+        def wrapper(
+            *args,
+            folder="defaultfoldername",
+            dataname="defaultdata",
+            description="describe data in file",
+            **kwargs,
+        ):
+            path = cache_dir / folder
+            datafile = path / f"{dataname}.npz"
+            commentfile = path / f"{dataname}_description.txt"
+            if datafile.exists() and commentfile.exists():
+                with open(commentfile, "r") as oldfile:
+                    old_description = oldfile.read()
+                    if not (old_description == description):
+                        raise ValueError(
+                            "Trying to save data to file {dataname}, but that file already exists with a different description than what is given. Change the description so it matches the existing one to load, or try a different filename."
+                        )
+                with np.load(datafile) as data:
+                    return {name: data[name] for name in data.files}
+            # File doesn't exist yet
+            result = func(*args, **kwargs)
+            path.mkdir(parents=True, exist_ok=True)
+
+            np.savez_compressed(datafile, **result)
+            commentfile.write_text(description)
             return result
 
         return wrapper
@@ -311,15 +360,11 @@ def Λ_single_q(wannier, rgrid, q):
     return np.sum(integrand, axis=0) / Nrx / Nry
 
 
-def localized_formfactor(qgrid, wannier, rgrid, name="formfactor", showprogress=True):
+@cache_under_name("cache/wannier")
+def localized_formfactor(qgrid, wannier, rgrid, showprogress=True):
     """
     Compute the formfactor Λ on a grid of values of q.
     """
-    cachepath = Path("cache/wannier")
-    datafile = cachepath / f"{name}.npz"
-    if datafile.exists():
-        with np.load(datafile) as data:
-            return {name: data[name] for name in data.files}
     qshape = np.shape(qgrid)[:-1]
     qinput = qgrid.reshape((-1, 2))
     Nq = len(qinput)
@@ -333,5 +378,61 @@ def localized_formfactor(qgrid, wannier, rgrid, name="formfactor", showprogress=
 
     Λ = Λ.reshape((2, 2, *qshape))
     data = {"formfactor": Λ, "qgrid": qgrid}
-    np.savez_compressed(datafile, **data)
+    return data
+
+
+def gate_screened_coulomb(q, d, ε_r):
+    """
+    Dual gate-screened form of the coulomb interaction in momentum space, with screening lenght d and relative permitivity ε_r
+    """
+    return COULOMB_COUPLING / (ε_r * q) * np.tanh(q * d)
+
+
+@cache_under_name("cache/wannier")
+def ffff_interaction(qgrid, Λ, R, **kwargs):
+    phase = np.exp(1j * np.einsum("xyq,...q->xy...", qgrid, R))
+    coulomb = gate_screened_coulomb(np.linalg.norm(qgrid, axis=-1), **kwargs)
+    interaction = np.einsum(
+        "mnxy,ijxy,xy...->mnij...",
+        Λ * coulomb[None, None, :, :],
+        Λ[:, :, ::-1, ::-1],
+        phase,
+    )
+    data = {"interaction": interaction, "Rgrid": R}
+    return data
+
+
+@cache_under_name("cache/wannier")
+def fdff_interaction(qgrid, Λ, r, R, showprogress=True, **kwargs):
+    """
+    Computes the fdff term of the interaction (assuming R'=0 w.l.o.g.).
+    Returns the interaction in two terms, V(r-R') and V(R-R').
+    The full interaction is
+    W(r-R)*(V(r-R')-V(R-R'))
+    """
+    rshape = np.shape(r)[:-1]
+    r = r.reshape((-1, 2))
+    Nr = len(r)
+    phaseR = np.exp(1j * np.einsum("xyi,...i->xy...", qgrid, R))
+    coulomb = gate_screened_coulomb(np.linalg.norm(qgrid, axis=-1), **kwargs)
+    Rterm = np.einsum(
+        "mnxy,ijxy,xy...->mnij...",
+        Λ * coulomb[None, None, :, :],
+        Λ[:, :, ::-1, ::-1],
+        phaseR,
+    )
+    rterm = np.zeros((2, 2, 2, 2, Nr))
+    for i, rval in enumerate(r):
+        if showprogress:
+            print(f"{i / Nr * 100:.1f} % done.")
+            clear_output(wait=True)
+        rterm[..., i] = np.einsum(
+            "mnxy,ijxy,xy->mnij",
+            np.eye(2)[:, :, None, None] * coulomb[None, None, :, :],
+            Λ[:, :, ::-1, ::-1],
+            np.exp(1j * np.dot(qgrid, rval)),
+        )
+    rterm = rterm.reshape((2, 2, 2, 2, *rshape))
+    r = r.reshape((*rshape, 2))
+    data = {"rterm": rterm, "Rterm": Rterm, "Rgrid": R, "rgrid": r}
     return data
