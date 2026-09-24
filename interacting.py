@@ -7,7 +7,6 @@ from pathlib import Path
 from IPython.display import clear_output
 
 COULOMB_COUPLING = 9  # eV*nM
-
 # Screening length should be between 5 and 40 nm.
 # To scale positions from units where the lattice vector is 1, multiply by
 SCALE_FACTOR = 4 * np.pi / np.sqrt(3)
@@ -74,6 +73,7 @@ def cache_under_name(cache_dir="cache/wannier"):
             folder="defaultfoldername",
             dataname="defaultdata",
             description="describe data in file",
+            overwrite=False,
             **kwargs,
         ):
             path = cache_dir / folder
@@ -82,13 +82,14 @@ def cache_under_name(cache_dir="cache/wannier"):
             if datafile.exists() and commentfile.exists():
                 with open(commentfile, "r") as oldfile:
                     old_description = oldfile.read()
-                    if not (old_description == description):
+                    if not ((old_description == description) or overwrite):
                         raise ValueError(
                             "Trying to save data to file {dataname}, but that file already exists with a different description than what is given. Change the description so it matches the existing one to load, or try a different filename."
                         )
-                with np.load(datafile) as data:
-                    return {name: data[name] for name in data.files}
-            # File doesn't exist yet
+                if not overwrite:
+                    with np.load(datafile) as data:
+                        return {name: data[name] for name in data.files}
+            # File doesn't exist yet or should be overwritten
             result = func(*args, **kwargs)
             path.mkdir(parents=True, exist_ok=True)
 
@@ -350,14 +351,14 @@ def Λ_single_q(wannier, rgrid, q):
     Compute the inner product <W_a|exp(iqr)|W_b> for one single value of q.
     """
     phase = np.exp(1j * np.dot(rgrid, q))
-    Nrx, Nry = np.shape(phase)
+    dr = np.linalg.norm(rgrid[0, 0] - rgrid[0, 1])
     integrand = (
         wannier.conj()[..., :, None]
         * wannier[..., None, :]
         * phase[..., None, None, None]
     )
     integrand = integrand.reshape((-1, 2, 2))
-    return np.sum(integrand, axis=0) / Nrx / Nry
+    return np.sum(integrand, axis=0) * dr**2
 
 
 @cache_under_name("cache/wannier")
@@ -390,13 +391,21 @@ def gate_screened_coulomb(q, d, ε_r):
 
 @cache_under_name("cache/wannier")
 def ffff_interaction(qgrid, Λ, R, **kwargs):
+    δAq = np.linalg.norm(qgrid[0, 0] - qgrid[0, 1]) * np.linalg.norm(
+        qgrid[0, 0] - qgrid[1, 0]
+    )
+    ABZ = 8 * np.pi**2 / np.sqrt(3)
+    NBZ = ABZ / δAq
     phase = np.exp(1j * np.einsum("xyq,...q->xy...", qgrid, R))
     coulomb = gate_screened_coulomb(np.linalg.norm(qgrid, axis=-1), **kwargs)
-    interaction = np.einsum(
-        "mnxy,ijxy,xy...->mnij...",
-        Λ * coulomb[None, None, :, :],
-        Λ[:, :, ::-1, ::-1],
-        phase,
+    interaction = (
+        np.einsum(
+            "mnxy,ijxy,xy...->mnij...",
+            Λ * coulomb[None, None, :, :],
+            Λ[:, :, ::-1, ::-1],
+            phase,
+        )
+        / NBZ
     )
     data = {"interaction": interaction, "Rgrid": R}
     return data
@@ -410,6 +419,11 @@ def fdff_interaction(qgrid, Λ, r, R, showprogress=True, **kwargs):
     The full interaction is
     W(r-R)*(V(r-R')-V(R-R'))
     """
+    δAq = np.linalg.norm(qgrid[0, 0] - qgrid[0, 1]) * np.linalg.norm(
+        qgrid[0, 0] - qgrid[1, 0]
+    )
+    ABZ = 8 * np.pi**2 / np.sqrt(3)
+    NBZ = ABZ / δAq
     rshape = np.shape(r)[:-1]
     r = r.reshape((-1, 2))
     Nr = len(r)
@@ -420,10 +434,10 @@ def fdff_interaction(qgrid, Λ, r, R, showprogress=True, **kwargs):
         Λ * coulomb[None, None, :, :],
         Λ[:, :, ::-1, ::-1],
         phaseR,
-    )
-    rterm = np.zeros((2, 2, 2, 2, Nr))
+    ) / (NBZ)
+    rterm = np.zeros((2, 2, 2, 2, Nr), dtype=complex)
     for i, rval in enumerate(r):
-        if showprogress:
+        if showprogress and (i % 100 == 0):
             print(f"{i / Nr * 100:.1f} % done.")
             clear_output(wait=True)
         rterm[..., i] = np.einsum(
@@ -431,7 +445,7 @@ def fdff_interaction(qgrid, Λ, r, R, showprogress=True, **kwargs):
             np.eye(2)[:, :, None, None] * coulomb[None, None, :, :],
             Λ[:, :, ::-1, ::-1],
             np.exp(1j * np.dot(qgrid, rval)),
-        )
+        ) / (NBZ)
     rterm = rterm.reshape((2, 2, 2, 2, *rshape))
     r = r.reshape((*rshape, 2))
     data = {"rterm": rterm, "Rterm": Rterm, "Rgrid": R, "rgrid": r}

@@ -6,6 +6,8 @@ import matplotlib as mpl
 # from scipy.special import assoc_laguerre as lag
 # from math import factorial
 
+e_over_2hbar = 0.001519  # 1 / (T nm^2)
+
 vhbar = 0.6582  # eV*nm
 σx = np.array([[0, 1], [1, 0]])
 σy = np.array([[0, -1j], [1j, 0]])
@@ -235,6 +237,45 @@ def build_H(k, q, w=0.11, cutoff=5, extra_hoppings=(), phases=None, **kwargs):
     H += np.kron(adM, coupling)[*extra_axes, ...]
 
     return H[0] if single else H
+
+
+def build_D(cutoff=9):
+    """
+    Build the velocity operator for a given UV cutoff. Note that this is k-independent.
+    """
+    Nshells = len(build_lattice(cutoff))
+    dxH = np.kron(np.eye(Nshells), σx)
+    dyH = np.kron(np.eye(Nshells), σy)
+    return np.array([dxH, dyH])
+
+
+def magnetic_moment(blochstates, energies, flatband_energy, cutoff=9):
+    """
+    Calculate the magnetic moment matrix in a flatband manifold with given energy.
+    Returns mz[momentum,n,m], in units of eV/T.
+    """
+    D = build_D(cutoff)
+    sortfrom_flatband = np.argsort(abs(energies - flatband_energy), axis=-1)
+    E = np.take_along_axis(energies, sortfrom_flatband, axis=-1)[..., 2:]
+    U = np.take_along_axis(blochstates, sortfrom_flatband[..., None, :], axis=-1)
+    Dnm = np.einsum(
+        "...an,jab,...bm->j...nm", U[..., :2].conj(), D, U[..., 2:], optimize=True
+    )
+    Dxnm = Dnm[0]
+    Dynm = Dnm[1]
+    print(Dnm.shape)
+    mz = (
+        1j
+        * e_over_2hbar
+        * np.einsum(
+            "iknl,jkml,kl->ijknm",
+            Dnm,
+            Dnm.conj(),
+            1 / (flatband_energy - E),
+        )
+    )
+    print(np.min(abs(flatband_energy - E)))
+    return mz[0, 1] - mz[1, 0]
 
 
 def H_along_path(θ, shape="hexagonal", **kwargs):
