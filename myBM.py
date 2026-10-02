@@ -2,6 +2,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import matplotlib as mpl
+from cache import cache_under_name
+from cache import disk_cached
+from IPython.display import clear_output
+import warnings
 
 # from scipy.special import assoc_laguerre as lag
 # from math import factorial
@@ -159,7 +163,7 @@ def are_nearest_neighbors(p1, p2, distance=1):
     return np.isclose(np.linalg.norm(p2 - p1), distance)
 
 
-def build_adjacency_matrix(lattice, **kwargs):
+def build_adjacency_matrix(lattice, anisotropy=None, **kwargs):
     """
     Builds an adjacency matrix for a given reciprocal lattice, simply noting which lattice points are nearest neighbours.
     The possible additional argument is for choosing a different nearest-neighbour distance than 1, the default.
@@ -169,8 +173,20 @@ def build_adjacency_matrix(lattice, **kwargs):
     for i in range(N):
         for j in range(N):
             if are_nearest_neighbors(lattice[i], lattice[j], **kwargs):
-                M[i, j] = 1
-                M[j, i] = 1
+                s = 1
+                if anisotropy is not None:
+                    dirvecs = np.array([q1, -q1, q2, -q2, q3, -q3])
+                    ind = (
+                        np.argmin(
+                            np.linalg.norm(
+                                (lattice[i] - lattice[j])[None, :] - dirvecs, axis=-1
+                            )
+                        )
+                        // 2
+                    )
+                    s = anisotropy[ind]
+                M[i, j] = s
+                M[j, i] = s
     return M
 
 
@@ -200,7 +216,17 @@ def get_q(θ):
     return 2 * k_D * np.sin(θ / 2)
 
 
-def build_H(k, q, w=0.11, cutoff=5, extra_hoppings=(), phases=None, **kwargs):
+def build_H(
+    k,
+    q,
+    w=0.11,
+    cutoff=5,
+    extra_hoppings=(),
+    phases=None,
+    uniform_perturbation=None,
+    coupling_matrix=np.eye(2),
+    **kwargs,
+):
     """
     Build the scattering hamiltonian for given k in mBZ, given scalar q indicating the scattering lenght, and a w indicating the
     strength of the scattering matrix elements in eV.
@@ -208,9 +234,9 @@ def build_H(k, q, w=0.11, cutoff=5, extra_hoppings=(), phases=None, **kwargs):
     extra_hoppings is a tuple that can contain higher order scattering vectors (i.e. integers indicating distances in reciprocal space: scattering is still assumed isotropic)
     phases is a way of making the scatterings anisotropic, but only for the lowest harmonic hexagonal lattice, giving scattering along q1,q2,q3 different complex phases.
     """
-    lat = build_lattice(cutoff, **kwargs)
+    lat = build_lattice(cutoff)
     if phases is None:
-        adM = build_adjacency_matrix(lat)
+        adM = build_adjacency_matrix(lat, **kwargs)
     else:
         # ONLY works for the hexagonal lattice right now, not implemented generally
         vecs = (q1, q2, q3)
@@ -227,7 +253,7 @@ def build_H(k, q, w=0.11, cutoff=5, extra_hoppings=(), phases=None, **kwargs):
     lat = np.array(lat)
     extra_axes = (None,) * nk
     all_momenta = k[None, ...] + q * lat[:, *extra_axes, :]  # Shape (*K,Nshells,2)
-    coupling = w * np.eye(2)
+    coupling = w * coupling_matrix
 
     H = np.zeros((*k_axes, Nshells, 2, Nshells, 2), dtype=complex)
     hdiag = dirac(all_momenta)  # Shape is (Nshells,,*K,2,2)
@@ -236,6 +262,11 @@ def build_H(k, q, w=0.11, cutoff=5, extra_hoppings=(), phases=None, **kwargs):
 
     H += np.kron(adM, coupling)[*extra_axes, ...]
 
+    if uniform_perturbation is not None:
+        perturbation_matrix = np.zeros((2, 2), dtype=complex)
+        for i in range(3):
+            perturbation_matrix += uniform_perturbation[i] * (σx, σy, σz)[i]
+        H += np.kron(np.eye(Nshells), perturbation_matrix)
     return H[0] if single else H
 
 
@@ -249,21 +280,25 @@ def build_D(cutoff=9):
     return np.array([dxH, dyH])
 
 
-def magnetic_moment(blochstates, energies, flatband_energy, cutoff=9):
+def magnetic_moment(blochstates, energies, band_energy, nbands=2, cutoff=9):
     """
-    Calculate the magnetic moment matrix in a flatband manifold with given energy.
+    Calculate the magnetic moment matrix in a degenerate band manifold with given energy.
     Returns mz[momentum,n,m], in units of eV/T.
+    band_energy can either be a number, or an array with the same shape as energies, except missing the final axis.
     """
+    if len(np.shape(np.asarray(band_energy))) > 0:
+        band_energy = band_energy[..., None]
     D = build_D(cutoff)
-    sortfrom_flatband = np.argsort(abs(energies - flatband_energy), axis=-1)
-    E = np.take_along_axis(energies, sortfrom_flatband, axis=-1)[..., 2:]
-    U = np.take_along_axis(blochstates, sortfrom_flatband[..., None, :], axis=-1)
+    sortfrom_reference = np.argsort(abs(energies - band_energy), axis=-1)
+    E = np.take_along_axis(energies, sortfrom_reference, axis=-1)[..., nbands:]
+    U = np.take_along_axis(blochstates, sortfrom_reference[..., None, :], axis=-1)
     Dnm = np.einsum(
-        "...an,jab,...bm->j...nm", U[..., :2].conj(), D, U[..., 2:], optimize=True
+        "...an,jab,...bm->j...nm",
+        U[..., :nbands].conj(),
+        D,
+        U[..., nbands:],
+        optimize=True,
     )
-    Dxnm = Dnm[0]
-    Dynm = Dnm[1]
-    print(Dnm.shape)
     mz = (
         1j
         * e_over_2hbar
@@ -271,29 +306,20 @@ def magnetic_moment(blochstates, energies, flatband_energy, cutoff=9):
             "iknl,jkml,kl->ijknm",
             Dnm,
             Dnm.conj(),
-            1 / (flatband_energy - E),
+            1 / (band_energy - E),
         )
     )
-    print(np.min(abs(flatband_energy - E)))
     return mz[0, 1] - mz[1, 0]
 
 
-def H_along_path(θ, shape="hexagonal", **kwargs):
+def H_along_path(θ, **kwargs):
     """
     Take a twist angle θ and builds the scattering hamiltonian along the high-symmetry
     path of the miniBZ, with any further arguments passed along to build_H.
     """
     q = get_q(θ * π / 180)
-    if shape == "hexagonal":
-        path = hexagonalpath
-    elif shape == "square":
-        path = squarepath
-    elif shape == "honeycomb":
-        path = honeycombpath
-    else:
-        path = [np.zeros(2)]
-    print(q)
-    H = build_H(q * path, q, shape=shape, **kwargs)
+    path = hexagonalpath
+    H = build_H(q * path, q, **kwargs)
 
     return H
 
@@ -458,12 +484,14 @@ def plot_bands(w, θ, cutoff=8, minE=-0.33, maxE=0.0, **kwargs):
     return fig, ax
 
 
+@disk_cached("cache")
 def states_on_grid(
     N,
     θ=0.8,
     flatband_energy=0.216,
-    energy_window=0.005,
-    max_active_bands=3,
+    nfb=3,
+    n_above=1,
+    n_below=0,
     points_per_chunk=5000,
     give_updates=False,
     **kwargs,
@@ -481,6 +509,11 @@ def states_on_grid(
     k2 = -q1[None, :] * x[:, None]
     Kgrid = k1[:, None, :] + k2[None, :, :]
     Kgrid *= q
+    E_Γpoint = np.linalg.eigvalsh(build_H(np.zeros(2), q=q, **kwargs))
+    fb_ind = np.argsort(abs(E_Γpoint - flatband_energy), axis=-1)[:nfb]
+    band_ind = np.arange(
+        np.min(fb_ind) - n_below, np.max(fb_ind) + n_above + 1, 1, dtype=int
+    )
     activebands_chunks = []
     activestates_chunks = []
     rows_per_chunk = max(1, points_per_chunk // N)
@@ -491,37 +524,15 @@ def states_on_grid(
         Kchunk = Kgrid[start:stop]
         h = build_H(Kchunk, q=q, **kwargs)
         E, U = np.linalg.eigh(h)
-        active_condition = (
-            abs(E - flatband_energy) < energy_window
-        )  # Boolean array for states that lie within the selected window
-        n_active = np.sum(active_condition, axis=-1)
-        if np.any(n_active > max_active_bands):
-            raise ValueError(
-                f"More than max_active_bands = {max_active_bands} found in energy window."
-            )
-        ordering = np.argsort(np.abs(E - flatband_energy), axis=-1)[
-            ..., :max_active_bands
-        ]
-        activebands = np.take_along_axis(E, ordering, axis=-1)
-        activestates = np.take_along_axis(U, ordering[..., None, :], axis=-1)
-        active_mask = np.take_along_axis(active_condition, ordering, axis=-1)
-        activebands = np.where(
-            active_mask,
-            activebands,
-            np.nan,
-        )
-        activestates = np.where(
-            active_mask[..., None, :],
-            activestates,
-            np.nan,
-        )
+        activebands = E[..., band_ind]
+        activestates = U[..., band_ind]
         activebands_chunks.append(activebands)
         activestates_chunks.append(activestates)
-        del h, E, U, ordering, active_condition
+        del h, E, U
     # Reassemble the chunks into the original grid shape.
     activebands = np.concatenate(activebands_chunks, axis=0)
     activestates = np.concatenate(activestates_chunks, axis=0)
-    return {"bands": activebands, "blochstates": activestates, "kgrid": Kgrid / q}
+    return {"bands": activebands, "blochstates": activestates, "kgrid": Kgrid}
 
 
 def translate_lattice(lat, g):
@@ -579,3 +590,222 @@ def berry_phase(k, targetE, N=60, **kwargs):
         phase = np.sum(targetStates[i - 1].conj() * targetStates[i])
         berryphase *= phase
     return np.angle(berryphase)
+
+
+def magnetic_moment_and_states(
+    K,
+    band_indices,
+    fb_energy=0.161,
+    degeneracy_tolerance=0.001,
+    # safewindow=0.015,
+    cutoff=9,
+    **kwargs,
+):
+    kshape = np.shape(K)[:-1]
+
+    Efull, Ufull = np.linalg.eigh(build_H(K, cutoff=cutoff, **kwargs))
+    # threeband_subspace[out_of_window,2] = dispersiveband[out_of_window,0]
+    # Compute number of bands at flatband energy at each index
+    bands_at_fb_energy = np.sum(abs(Efull - fb_energy) < degeneracy_tolerance, axis=-1)
+    # Where is the dispersive band crossing?
+    threefold = bands_at_fb_energy == 3
+    twofold = bands_at_fb_energy == 2
+    magnetic_tensor = np.zeros((*kshape, 3, 3), dtype=complex)
+    ###Compute 3x3 matrix at threefold degenerate lines:
+
+    m33 = magnetic_moment(
+        Ufull[threefold], Efull[threefold], fb_energy, cutoff=cutoff, nbands=3
+    )
+    ###Compute 2x2 matrix at all other points for the flatbands:
+    m22 = magnetic_moment(
+        Ufull[twofold], Efull[twofold], fb_energy, cutoff=cutoff, nbands=2
+    )
+    ###Compute the abelian magnetic moment for the dispersive band where it lies in the relevant energyrange
+    magnetic_tensor[threefold, ...] = m33
+    magnetic_tensor[twofold, :2, :2] = m22
+    return Ufull[..., band_indices], Efull[..., band_indices], magnetic_tensor
+
+
+@disk_cached("cache/magnetic")
+def μ_and_states(
+    Nk=20,
+    θ=0.72,
+    points_per_chunk=100,
+    fb_energy=0.161,
+    dtol=0.001,
+    give_updates=False,
+    **kwargs,
+):
+    kθ = get_q(θ / 180 * np.pi)
+    arr = np.linspace(-0.5, 0.5, Nk, endpoint=False)
+    k1 = arr[:, None] * q2 * kθ
+    k2 = -arr[:, None] * q1 * kθ
+    K = k1[:, None, :] + k2[None, :, :]
+    E0, U0 = np.linalg.eigh(build_H(np.zeros((2)), q=kθ, **kwargs))
+    ndof = np.shape(U0)[-2]
+    fb_ind = np.argsort(abs(E0 - fb_energy), axis=-1)[:2]
+    band_ind = np.arange(np.min(fb_ind), np.max(fb_ind) + 2, 1, dtype=int)
+    rows_per_chunk = max(1, points_per_chunk // Nk)
+    μ_magnetic = np.zeros((Nk, Nk, 3, 3), dtype=complex)
+    allstates = np.zeros((Nk, Nk, ndof, 3), dtype=complex)
+    allenergies = np.zeros((Nk, Nk, 3), dtype=complex)
+    for start in range(0, Nk, rows_per_chunk):
+        stop = min(start + rows_per_chunk, Nk)
+        if give_updates:
+            print(f"Computing row {start} to {stop} of {Nk}.")
+            clear_output(wait=True)
+        Kchunk = K[start:stop]
+        u, e, μ = magnetic_moment_and_states(
+            Kchunk,
+            band_ind,
+            degeneracy_tolerance=dtol,
+            q=kθ,
+            fb_energy=fb_energy,
+            **kwargs,
+        )
+        μ_magnetic[start:stop] = np.asarray(μ)
+        allstates[start:stop] = np.asarray(u)
+        allenergies[start:stop] = np.asarray(e)
+    data = {
+        "magnetic_moment": μ_magnetic,
+        "states": allstates,
+        "bands": allenergies,
+        "grid": K,
+    }
+    return data
+
+
+def magnetic_bands(E, U, μ, B=0.5):
+    magnetic_H = np.zeros_like(μ)
+    magnetic_H[..., range(3), range(3)] = E
+    magnetic_H += B * μ
+    B_bands, B_states = np.linalg.eigh(magnetic_H)
+    Full_states = np.einsum("...bn,...ab->...an", B_states, U)
+    return B_bands, Full_states
+
+
+def berry_curvature(U, δ=1e-5):
+    """
+    Computes the chern number for a given isolated band, given the blochstate of said band.
+    Requires U0,1,2,3 being the bloch state evaluated at the four cournes of a square, side-length δ, each across the whole BZ.
+    """
+    U1, U2, U3, U4 = U[0], U[1], U[2], U[3]
+    print(np.shape(U1))
+    φ = np.einsum("...an,...an->...n", U1.conj(), U2)
+    print(np.min(abs(φ)))
+    φ *= np.einsum("...an,...an->...n", U2.conj(), U3)
+    print(np.min(abs(φ)))
+    φ *= np.einsum("...an,...an->...n", U3.conj(), U4)
+    print(np.min(abs(φ)))
+    φ *= np.einsum("...an,...an->...n", U4.conj(), U1)
+    print(np.min(abs(φ)))
+    print(np.shape(φ))
+    φ = np.angle(φ) / δ**2
+    return φ
+
+
+def berry_fhs(kgrid, vecs, b1, b2, Gvecs):
+    """
+    Parameters
+    ----------
+    kgrid : (N, N, 2) or (N*N, 2) momenta of a regular N x N grid along b1, b2.
+            Any origin and ordering; points may be shifted by reciprocal lattice vectors.
+    vecs  : (N, N, 2*nG) or (N, N, 2*nG, nbands) Bloch vectors in the plane-wave basis,
+            G_major (index 2*iG + s), same point ordering as kgrid.
+            Several bands -> Berry curvature/Chern number of the band group (non-Abelian).
+            Vectors need no particular gauge; only orthonormality within each k.
+    b1, b2: reciprocal lattice basis vectors.
+    Gvecs : (nG, 2) reciprocal lattice vectors in the plane-wave order of vecs.
+
+    Returns
+    -------
+    dict with
+      Omega      : (N, N) Berry curvature, indexed by grid residue (i1, i2) along (b1, b2)
+      kpts       : (N, N, 2) actual momenta belonging to Omega
+      chern      : Chern number (integer up to rounding if the group is gapped)
+      max_flux   : max |flux| per plaquette (should be well below pi)
+      min_overlap: min |det| of link overlaps (small -> not gapped or grid too coarse)
+    """
+    B = np.column_stack([b1, b2]).astype(float)
+    Binv = np.linalg.inv(B)
+    k = np.asarray(kgrid, float).reshape(-1, 2)
+    Nk = len(k)
+    N = int(round(np.sqrt(Nk)))
+    if N * N != Nk:
+        raise ValueError("kgrid must contain N*N points")
+    nG = len(Gvecs)
+    v = np.asarray(vecs, complex)
+    if v.size % (Nk * 2 * nG):
+        raise ValueError(f"vecs must have 2*nG = {2 * nG} components per k-point")
+    v = v.reshape(Nk, 2 * nG, -1)  # (Nk, 2nG, nb)
+
+    # --- sort the grid by residues (i1, i2) mod N, keep actual fractional momenta
+    x = N * (k @ Binv.T)
+    c = x[0] - np.rint(x[0])
+    n = np.rint(x - c)
+    if np.abs(x - c - n).max() > 1e-6:
+        raise ValueError("kgrid is not a regular N x N grid along b1, b2")
+    n = n.astype(int)
+    I = np.mod(n, N)
+    flat = I[:, 0] * N + I[:, 1]
+    if len(np.unique(flat)) != Nk:
+        raise ValueError("kgrid does not contain every grid point exactly once")
+    o = np.argsort(flat)
+    k, v, kfrac = k[o], v[o], n[o] / N
+
+    # --- plane-wave shifts: coefficients of the state at k + G_g
+    gint = np.asarray(Gvecs, float) @ Binv.T
+    Gint = np.rint(gint).astype(int)
+    if np.abs(gint - Gint).max() > 1e-6:
+        raise ValueError("Gvecs are not integer combinations of b1, b2")
+    lookup = {tuple(m): i for i, m in enumerate(Gint)}
+
+    def shifted(V, g):
+        idx = np.array([lookup.get((a + g[0], b + g[1]), nG) for a, b in Gint])
+        Vp = np.concatenate(
+            [
+                V.reshape(len(V), nG, 2, -1),
+                np.zeros((len(V), 1, 2, V.shape[-1]), V.dtype),
+            ],
+            axis=1,
+        )
+        return Vp[:, idx].reshape(V.shape)
+
+    # --- link variables U_mu(k) = det <u_k | u_{k+mu}>
+    links, min_ov = [], np.inf
+    for mu in (np.array([1, 0]), np.array([0, 1])):
+        tgt = kfrac + mu / N
+        r = np.mod(np.rint(tgt * N).astype(int), N)
+        jj = r[:, 0] * N + r[:, 1]
+        gsh = np.rint(tgt - kfrac[jj]).astype(int)
+        vn = v[jj]
+        for gv in np.unique(gsh, axis=0):
+            if gv.any():
+                sel = np.all(gsh == gv, axis=1)
+                vn[sel] = shifted(v[jj[sel]], gv)
+        d = np.linalg.det(np.einsum("kpm,kpn->kmn", v.conj(), vn))
+        min_ov = min(min_ov, np.abs(d).min())
+        links.append((d / np.abs(d)).reshape(N, N))
+    U1, U2 = links
+
+    # --- plaquette fluxes and curvature
+    F = np.angle(
+        U1 * np.roll(U2, -1, axis=0) * np.roll(U1, -1, axis=1).conj() * U2.conj()
+    )
+    orient = np.sign(np.linalg.det(B))
+    dA = abs(np.linalg.det(B)) / Nk
+    Omega = -orient * F / dA
+    chern = -orient * F.sum() / (2 * np.pi)
+    if min_ov < 1e-6:
+        warnings.warn("tiny link overlap: band group not gapped or grid too coarse")
+    if np.abs(F).max() > 0.5 * np.pi:
+        warnings.warn(
+            "flux per plaquette above pi/2: grid likely too coarse near a hotspot"
+        )
+    return dict(
+        Omega=Omega,
+        kpts=k.reshape(N, N, 2),
+        chern=chern,
+        max_flux=np.abs(F).max(),
+        min_overlap=min_ov,
+    )

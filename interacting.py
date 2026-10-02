@@ -1,10 +1,8 @@
 import numpy as np
-import math
 import myBM as bm
-import json
-import hashlib
-from pathlib import Path
 from IPython.display import clear_output
+from cache import disk_cached
+from cache import cache_under_name
 
 COULOMB_COUPLING = 9  # eV*nM
 # Screening length should be between 5 and 40 nm.
@@ -13,103 +11,6 @@ SCALE_FACTOR = 4 * np.pi / np.sqrt(3)
 # AND DIVIDE by the potential scale kθ. For our standard value of θ=0.72, we define the overall scaling
 PHYSICAL_SCALING = SCALE_FACTOR / bm.get_q(0.72 / 180 * np.pi)
 # Note of course that when a the screening length is given in physical units, it therefore needs to by DIVIDED by that number.
-
-
-def make_data_key(params):
-    params_json = json.dumps(params, sort_keys=True)
-    return hashlib.sha256(params_json.encode()).hexdigest()
-
-
-def disk_cached(cache_dir="cache"):
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def decorator(func):
-        # arrays should be numpy arrays that are input, shouldn't be cached and therefore given as POSITIONAL arguments ONLY.
-        def wrapper(*arrays, **params):
-            updatebool = params.pop("give_updates", False)
-            chunksize = params.pop("points_per_chunk", 2048)
-            key = make_data_key(params)
-            path = cache_dir / key
-
-            data_file = path / "data.npz"
-            params_file = path / "params.json"
-
-            # Cache hit
-            if data_file.exists() and params_file.exists():
-                with np.load(data_file) as data:
-                    return {name: data[name] for name in data.files}
-
-            # Cache miss
-            result = func(
-                *arrays, **params, give_updates=updatebool, points_per_chunk=chunksize
-            )
-
-            # Save atomically-ish into its own directory
-            path.mkdir(parents=True, exist_ok=True)
-
-            np.savez_compressed(data_file, **result)
-
-            with open(params_file, "w") as f:
-                json.dump(params, f, indent=2, sort_keys=True)
-
-            return result
-
-        return wrapper
-
-    return decorator
-
-
-def cache_under_name(cache_dir="cache/wannier"):
-    """
-    Decorate a function to save it's output to a specified file and folder, as well as a description of the generated data. If those things match previously cached output, that is loaded and returned instead. Raises an error if folder and filename match existing data, but the description differs (to prevent overwriting data).
-    """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def decorator(func):
-        def wrapper(
-            *args,
-            folder="defaultfoldername",
-            dataname="defaultdata",
-            description="describe data in file",
-            overwrite=False,
-            **kwargs,
-        ):
-            path = cache_dir / folder
-            datafile = path / f"{dataname}.npz"
-            commentfile = path / f"{dataname}_description.txt"
-            if datafile.exists() and commentfile.exists():
-                with open(commentfile, "r") as oldfile:
-                    old_description = oldfile.read()
-                    if not ((old_description == description) or overwrite):
-                        raise ValueError(
-                            "Trying to save data to file {dataname}, but that file already exists with a different description than what is given. Change the description so it matches the existing one to load, or try a different filename."
-                        )
-                if not overwrite:
-                    with np.load(datafile) as data:
-                        return {name: data[name] for name in data.files}
-            # File doesn't exist yet or should be overwritten
-            result = func(*args, **kwargs)
-            path.mkdir(parents=True, exist_ok=True)
-
-            np.savez_compressed(datafile, **result)
-            commentfile.write_text(description)
-            return result
-
-        return wrapper
-
-    return decorator
-
-
-@disk_cached("cache")
-def blochfactors(**kwargs):
-    """
-    Simply compute bloch factors for a set of parameters of the hamiltonian,
-    but check if these bloch factors have been previously computed and cached first. Only computes new ones if necessary.
-    Note: Returns and saves a dictionary with fields "bands","blochstates" and "kgrid".
-    """
-    return bm.states_on_grid(**kwargs)
 
 
 def band_selection(Ψ):
@@ -162,7 +63,7 @@ def two_band_subspace(momentum_radius=0.35, overlap_tolerance=0.7, **kwargs):
     Within the radius given by momentum_radius, discard any states with less overall overlap with the flatbands at the zone center than overlap_tolerance.
     The discarded blochstates are each replaced by the neighbouring state with largest overlap, which will introduce some error, but amounts to neglecting the very small observed hybridization.
     """
-    data = blochfactors(**kwargs)
+    data = bm.states_on_grid(**kwargs)
     Ψ = data["blochstates"]
     kgrid = data["kgrid"]
     Nx, Ny = np.shape(Ψ)[:2]
@@ -248,13 +149,12 @@ def λ_formfactor(k, q, cutoff=9, **kwargs):
     diagonalized once for each set of parameters.
     Returns λ, an array with shape (...,n,n), with ... the same as in k and q, and n the number of active bands (flatbands first).
     """
-    single_particle_data = blochfactors(cutoff=cutoff, **kwargs)
+    single_particle_data = bm.states_on_grid(cutoff=cutoff, **kwargs)
     print("Bloch-states are computed.")
     print(single_particle_data.keys())
     kdata = single_particle_data["kgrid"]
     states = single_particle_data["blochstates"]
     energies = single_particle_data["bands"]
-    bandnumber = np.shape(energies)[-1]
     # Convert the k-array into an array of indices into the precomputed data:
     idx_k = nearest_indices(kdata, k)
     states_k = states[
@@ -358,7 +258,7 @@ def Λ_single_q(wannier, rgrid, q):
         * phase[..., None, None, None]
     )
     integrand = integrand.reshape((-1, 2, 2))
-    return np.sum(integrand, axis=0) * dr**2
+    return np.sum(integrand, axis=0) * dr**2 * 2 / np.sqrt(3)
 
 
 @cache_under_name("cache/wannier")
@@ -391,13 +291,15 @@ def gate_screened_coulomb(q, d, ε_r):
 
 @cache_under_name("cache/wannier")
 def ffff_interaction(qgrid, Λ, R, **kwargs):
-    δAq = np.linalg.norm(qgrid[0, 0] - qgrid[0, 1]) * np.linalg.norm(
-        qgrid[0, 0] - qgrid[1, 0]
-    )
-    ABZ = 8 * np.pi**2 / np.sqrt(3)
-    NBZ = ABZ / δAq
+    δAq = (
+        np.linalg.norm(qgrid[0, 0] - qgrid[0, 1])
+        * np.linalg.norm(qgrid[0, 0] - qgrid[1, 0])
+        / PHYSICAL_SCALING**2
+    )  # dq^2 in physical units
     phase = np.exp(1j * np.einsum("xyq,...q->xy...", qgrid, R))
-    coulomb = gate_screened_coulomb(np.linalg.norm(qgrid, axis=-1), **kwargs)
+    coulomb = gate_screened_coulomb(
+        np.linalg.norm(qgrid / PHYSICAL_SCALING, axis=-1), **kwargs
+    )
     interaction = (
         np.einsum(
             "mnxy,ijxy,xy...->mnij...",
@@ -405,7 +307,8 @@ def ffff_interaction(qgrid, Λ, R, **kwargs):
             Λ[:, :, ::-1, ::-1],
             phase,
         )
-        / NBZ
+        * δAq
+        / (2 * np.pi) ** 2
     )
     data = {"interaction": interaction, "Rgrid": R}
     return data
@@ -419,33 +322,43 @@ def fdff_interaction(qgrid, Λ, r, R, showprogress=True, **kwargs):
     The full interaction is
     W(r-R)*(V(r-R')-V(R-R'))
     """
-    δAq = np.linalg.norm(qgrid[0, 0] - qgrid[0, 1]) * np.linalg.norm(
-        qgrid[0, 0] - qgrid[1, 0]
+    δAq = (
+        np.linalg.norm(qgrid[0, 0] - qgrid[0, 1])
+        * np.linalg.norm(qgrid[0, 0] - qgrid[1, 0])
+        / PHYSICAL_SCALING**2
     )
-    ABZ = 8 * np.pi**2 / np.sqrt(3)
-    NBZ = ABZ / δAq
     rshape = np.shape(r)[:-1]
     r = r.reshape((-1, 2))
     Nr = len(r)
     phaseR = np.exp(1j * np.einsum("xyi,...i->xy...", qgrid, R))
-    coulomb = gate_screened_coulomb(np.linalg.norm(qgrid, axis=-1), **kwargs)
-    Rterm = np.einsum(
-        "mnxy,ijxy,xy...->mnij...",
-        Λ * coulomb[None, None, :, :],
-        Λ[:, :, ::-1, ::-1],
-        phaseR,
-    ) / (NBZ)
+    coulomb = gate_screened_coulomb(
+        np.linalg.norm(qgrid / PHYSICAL_SCALING, axis=-1), **kwargs
+    )
+    Rterm = (
+        np.einsum(
+            "mnxy,ijxy,xy...->mnij...",
+            Λ * coulomb[None, None, :, :],
+            Λ[:, :, ::-1, ::-1],
+            phaseR,
+        )
+        * δAq
+        / (2 * np.pi) ** 2
+    )
     rterm = np.zeros((2, 2, 2, 2, Nr), dtype=complex)
     for i, rval in enumerate(r):
         if showprogress and (i % 100 == 0):
             print(f"{i / Nr * 100:.1f} % done.")
             clear_output(wait=True)
-        rterm[..., i] = np.einsum(
-            "mnxy,ijxy,xy->mnij",
-            np.eye(2)[:, :, None, None] * coulomb[None, None, :, :],
-            Λ[:, :, ::-1, ::-1],
-            np.exp(1j * np.dot(qgrid, rval)),
-        ) / (NBZ)
+        rterm[..., i] = (
+            np.einsum(
+                "mnxy,ijxy,xy->mnij",
+                np.eye(2)[:, :, None, None] * coulomb[None, None, :, :],
+                Λ[:, :, ::-1, ::-1],
+                np.exp(1j * np.dot(qgrid, rval)),
+            )
+            * δAq
+            / (2 * np.pi) ** 2
+        )
     rterm = rterm.reshape((2, 2, 2, 2, *rshape))
     r = r.reshape((*rshape, 2))
     data = {"rterm": rterm, "Rterm": Rterm, "Rgrid": R, "rgrid": r}
